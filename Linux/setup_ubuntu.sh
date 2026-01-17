@@ -19,9 +19,7 @@ info(){ printf "
 ok(){ printf "
 [OK] %s
 " "$1"; }
-warn(){ printf "
-[WARN] %s
-" "$1"; }
+warn(){ printf "\n[WARN] %s\n" "$1"; }
 err(){ printf "
 [ERROR] %s
 " "$1"; }
@@ -65,6 +63,9 @@ if [[ -n "$SSH_PORT" && ! "$SSH_PORT" =~ ^[0-9]+$ ]]; then
   err "SSH port must be a number. Exiting."; exit 3
 fi
 
+read -r -p "Apply SSH hardening (disable root/password login)? (y/N): " APPLY_HARDENING
+APPLY_HARDENING="${APPLY_HARDENING:-n}"
+
 read -r -p "Server tag for Telegram messages (leave empty to skip): " SERVER_TAG
 SERVER_TAG="${SERVER_TAG:-}"
 
@@ -84,6 +85,7 @@ info "Summary of actions (empty = will be skipped):"
 echo " - Create user: ${USERNAME:-<skip>}"
 echo " - Set password: $( [[ -n "$PASS" ]] && echo 'yes' || echo 'no')"
 echo " - Change SSH port: ${SSH_PORT:-<skip>}"
+echo " - Apply SSH hardening: ${APPLY_HARDENING:-no}"
 echo " - Server tag: ${SERVER_TAG:-<none>}"
 echo " - Telegram enabled: $([[ "$USE_TG" =~ ^[Yy]$ ]] && echo YES || echo NO)"
 if ! confirm "Proceed and apply changes? (y/N): "; then info "Aborted by user."; exit 0; fi
@@ -101,18 +103,16 @@ if [[ -n "$USERNAME" ]]; then
     info "Creating user $USERNAME..."
     adduser --disabled-password --gecos "" "$USERNAME" >/dev/null
     usermod -aG sudo,adm "$USERNAME"
-    printf "%s ALL=(ALL) NOPASSWD:ALL
-" "$USERNAME" > "/etc/sudoers.d/90_${USERNAME}_nopasswd"
-    chmod 0440 "/etc/sudoers.d/90_${USERNAME}_nopasswd"
+    # Standard sudo access (password required)
+    # Passwordless sudo can be added manually if needed
     STEP_USER_CREATED=1
-    ok "User $USERNAME created and added to sudo (NOPASSWD)."
+    ok "User $USERNAME created and added to sudo."
   fi
 
   if [[ -n "$PASS" ]]; then
     info "Setting password for $USERNAME..."
     printf '%s:%s
 ' "$USERNAME" "$PASS" | chpasswd
-    STEP_PASS_SET=1
     ok "Password set for $USERNAME."
   fi
 
@@ -171,32 +171,39 @@ set_sshd() {
 }
 
 SSH_CHANGED=0
-if [[ -n "$SSH_PORT" ]]; then
-  # Validate port number range
-  if (( SSH_PORT < 1025 || SSH_PORT > 65000 )); then
-    err "SSH port must be between 1025 and 65000. Exiting."; exit 4
-  fi
-  info "Applying SSH hardening and setting Port=${SSH_PORT}..."
-  set_sshd "Port" "$SSH_PORT"
+
+# Apply SSH hardening independently
+if [[ "$APPLY_HARDENING" =~ ^[Yy]$ ]]; then
+  info "Applying SSH hardening (key-only, no root/password)..."
   set_sshd "PermitRootLogin" "no"
   set_sshd "PasswordAuthentication" "no"
+  set_sshd "KbdInteractiveAuthentication" "no"
   set_sshd "ChallengeResponseAuthentication" "no"
   set_sshd "PubkeyAuthentication" "yes"
   set_sshd "UsePAM" "yes"
   set_sshd "PermitEmptyPasswords" "no"
-  set_sshd "AuthenticationMethods" "publickey"
   SSH_CHANGED=1
-else
-  info "No SSH port change requested; skipping SSH config modification."
 fi
+
+# Apply SSH port change independently
+if [[ -n "$SSH_PORT" ]]; then
+  if (( SSH_PORT < 1025 || SSH_PORT > 65000 )); then
+    err "SSH port must be between 1025 and 65000. Exiting."; exit 4
+  fi
+  info "Setting SSH Port=${SSH_PORT}..."
+  set_sshd "Port" "$SSH_PORT"
+  SSH_CHANGED=1
+fi
+
+[[ $SSH_CHANGED -eq 0 ]] && info "No SSH changes requested; sshd_config untouched."
 
 # If we changed SSH config ensure UFW has the rule (already added) and test config then restart
 if [[ $SSH_CHANGED -eq 1 ]]; then
   info "Testing sshd configuration..."
   if sshd -t; then
-    info "sshd config OK — reloading ssh service..."
-    systemctl reload ssh || systemctl restart ssh || systemctl restart sshd || true
-    ok "SSH reloaded."
+    info "sshd config OK — restarting ssh service..."
+    systemctl restart ssh || systemctl restart sshd
+    ok "SSH restarted."
   else
     warn "sshd -t FAILED — restoring backup and aborting ssh restart."
     cp -a "$SSHD_BACKUP" "$SSHD_CFG"
@@ -218,7 +225,7 @@ filter = sshd
 logpath = %(sshd_log)s
 maxretry = 5
 bantime = 3600
-action = iptables-multiport
+action = nftables-multiport
 EOF
 ok "Wrote fail2ban jail: $F2B_JAIL_FILE"
 
@@ -300,4 +307,3 @@ echo " - Unban test IP: sudo fail2ban-client set sshd unbanip 203.0.113.5"
 
 echo
 ok "All done. If anything failed, check logs: journalctl -u fail2ban -n 200 --no-pager"
-systemctl restart ssh
